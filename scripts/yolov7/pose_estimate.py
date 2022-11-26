@@ -5,6 +5,8 @@ from message_filters import ApproximateTimeSynchronizer, TimeSynchronizer, Subsc
 from std_msgs.msg import Header
 from sensor_msgs import point_cloud2
 from sensor_msgs.msg import Image, PointCloud2, PointField, CameraInfo
+from geometry_msgs.msg import Point
+from visualization_msgs.msg import Marker
 from cv_bridge import CvBridge # Package to convert between ROS and OpenCV Images
 
 # Python Libs
@@ -41,6 +43,7 @@ class PoseEstimator:
         
         # self.image_sub = rospy.Subscriber("/zed/zed_node/rgb/image_rect_color", Image, self.image_callback)
         self.keypoint_pub = rospy.Publisher('keypoints', PointCloud2, queue_size=10)
+        self.vector_pub = rospy.Publisher("visualization_marker", Marker, queue_size=0)
         self.camera_info_sub = rospy.Subscriber("/zed/zed_node/left/camera_info", CameraInfo, self.camera_info_callback)
  
         # For OpenCV
@@ -70,6 +73,8 @@ class PoseEstimator:
                 PointField('z', 8, PointField.FLOAT32, 1),
                 PointField('intensity', 12, PointField.FLOAT32, 1)]
 
+        self.frame_id = "zed_left_camera_optical_frame"
+
     def load_model(self):
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.weigths = torch.load(self.model_filename)
@@ -95,11 +100,13 @@ class PoseEstimator:
         keypoints_3d = self.cvt_kpts_2d_to_3d(keypoints_2d, ratio, cv_depth_image, self.fx, self.fy, self.cx, self.cy)
         if(len(keypoints_3d) == 0):
             return
-        # directional_vector = self.get_right_hand_direction_vector(keypoints_3d)
+        directional_vector = self.get_right_hand_direction_vector(keypoints_3d)
 
         keypoints_3d = np.array(keypoints_3d)
         sensor_msg = self.to_sensor_msgs(keypoints_3d)
         self.keypoint_pub.publish(sensor_msg)
+        if(directional_vector != None):
+            self.draw_vector(directional_vector)
         # print("Direction Vector is ", directional_vector)
 
 
@@ -109,7 +116,7 @@ class PoseEstimator:
         points_3d = np.hstack((points_3d,np.ones([points_3d.shape[0],1], points_3d.dtype)))
         # print(points_3d)
         header = Header()
-        header.frame_id = "zed_left_camera_optical_frame"
+        header.frame_id = self.frame_id
         header.stamp = rospy.Time.now()
 
         points_3d = points_3d
@@ -176,20 +183,21 @@ class PoseEstimator:
         # "nose", "left_eye", "right_eye", "left_ear", "right_ear", "left_shoulder", "right_shoulder", 
         # "left_elbow", "right_elbow", "left_wrist", "right_wrist", "left_hip", "right_hip", "left_knee", 
         # "right_knee", "left_ankle", "right_ankle"
-        wrist_coord = []
-        elbow_coord = []
+        wrist_coord = np.nan
+        elbow_coord = np.nan
         for data_point in data:
             if(data_point[1] == 8):
                 elbow_coord = data_point[3:]
-                print(" Elbow Coord: ", elbow_coord)
+                # print(" Elbow Coord: ", elbow_coord)
             if(data_point[1] == 10):
                 wrist_coord = data_point[3:]
-                print(" Wrist Coord: ", wrist_coord)
+                # print(" Wrist Coord: ", wrist_coord)
         
         if(not (np.isfinite(elbow_coord).all() and np.isfinite(wrist_coord).all())):
             return None
         else:
-            return self.get_vector(wrist_coord, elbow_coord)
+            # return self.get_vector(wrist_coord, elbow_coord)
+            return [elbow_coord, wrist_coord]
 
     def get_vector(self, point_a, point_b):
         vector = []
@@ -262,6 +270,31 @@ class PoseEstimator:
 
     def exit(self):
         cv2.destroyAllWindows()
+
+    def draw_vector(self, vector, scale = 10, hide = False):
+        arrow = Marker()
+        arrow.header.frame_id = self.frame_id
+        arrow.header.stamp = rospy.Time.now()
+        arrow.id = 0
+        arrow.type = Marker.ARROW
+        start_point = Point()
+        start_point.x = vector[0][0]
+        start_point.y = vector[0][1]
+        start_point.z = vector[0][2]
+        end_point = Point()
+        end_point.x = scale*vector[1][0] - (scale-1)*start_point.x
+        end_point.y = scale*vector[1][1] - (scale-1)*start_point.y
+        end_point.z = scale*vector[1][2] - (scale-1)*start_point.z
+        arrow.points = [start_point, end_point]
+        arrow.scale.x = 0.1
+        arrow.scale.y = 0.1
+        arrow.scale.z = 0.05
+        arrow.color.a = 1.0
+        arrow.color.r = 1.0
+        arrow.color.g = 1.0
+        arrow.color.b = 1.0
+        arrow.action = 2 if hide else 0
+        self.vector_pub.publish(arrow)
 
     def plot_skeleton_kpts(self, im, kpts, steps, orig_shape=None):
         #Plot the skeleton and keypointsfor coco datatset

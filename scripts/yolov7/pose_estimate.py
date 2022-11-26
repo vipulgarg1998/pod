@@ -2,7 +2,9 @@
 # ROS Libs
 import rospy
 from message_filters import ApproximateTimeSynchronizer, TimeSynchronizer, Subscriber
-from sensor_msgs.msg import Image
+from std_msgs.msg import Header
+from sensor_msgs import point_cloud2
+from sensor_msgs.msg import Image, PointCloud2, PointField, CameraInfo
 from cv_bridge import CvBridge # Package to convert between ROS and OpenCV Images
 
 # Python Libs
@@ -11,6 +13,7 @@ import torch
 import cv2
 import numpy as np
 import time
+import ctypes
  
 # Open3D
 # import open3d as o3d
@@ -37,7 +40,9 @@ class PoseEstimator:
         tss.registerCallback(self.rgbd_callback)
         
         # self.image_sub = rospy.Subscriber("/zed/zed_node/rgb/image_rect_color", Image, self.image_callback)
-
+        self.keypoint_pub = rospy.Publisher('keypoints', PointCloud2, queue_size=10)
+        self.camera_info_sub = rospy.Subscriber("/zed/zed_node/left/camera_info", CameraInfo, self.camera_info_callback)
+ 
         # For OpenCV
         self.cv_bridge = CvBridge()
         self.cv_image = None
@@ -48,11 +53,22 @@ class PoseEstimator:
         self.weights = None
         self.model = None
 
-        # For Camera
-        self.fx = 1404.6019287109375
-        self.fy = 1404.6019287109375 
-        self.cx = 948.8173217773438
-        self.cy = 557.4688110351562
+        # For Camera 
+        # self.fx = 1404.6019287109375
+        # self.fy = 1404.6019287109375 
+        # self.cx = 948.8173217773438
+        # self.cy = 557.4688110351562
+        self.caliberation_params_init = False
+        self.fx = None
+        self.fy = None 
+        self.cx = None
+        self.cy = None
+
+        # PointCloud2 Fields
+        self.fields = [PointField('x', 0, PointField.FLOAT32, 1),
+                PointField('y', 4, PointField.FLOAT32, 1),
+                PointField('z', 8, PointField.FLOAT32, 1),
+                PointField('intensity', 12, PointField.FLOAT32, 1)]
 
     def load_model(self):
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -62,16 +78,45 @@ class PoseEstimator:
         _ = self.model.eval()
         print("Model Loaded")
 
+    def camera_info_callback(self, camera_info_msg):
+        K = camera_info_msg.K
+        self.fx = float(K[0])
+        self.cx = float(K[2])
+        self.fy = float(K[4])
+        self.cy = float(K[5])
+        self.caliberation_params_init = True
+
     def rgbd_callback(self, image_msg, depth_image_msg):
-        if(self.model == None):
+        if(self.model == None or not self.caliberation_params_init):
             return
         cv_depth_image = self.cv_bridge.imgmsg_to_cv2(depth_image_msg)
 
-        keypoints_2d, ratio = self.image_callback(image_msg)
+        keypoints_2d, ratio = self.image_callback(image_msg, view = False)
         keypoints_3d = self.cvt_kpts_2d_to_3d(keypoints_2d, ratio, cv_depth_image, self.fx, self.fy, self.cx, self.cy)
-        directional_vector = self.get_right_hand_direction_vector(keypoints_3d)
+        if(len(keypoints_3d) == 0):
+            return
+        # directional_vector = self.get_right_hand_direction_vector(keypoints_3d)
 
-        print("Direction Vector is ", directional_vector)
+        keypoints_3d = np.array(keypoints_3d)
+        sensor_msg = self.to_sensor_msgs(keypoints_3d)
+        self.keypoint_pub.publish(sensor_msg)
+        # print("Direction Vector is ", directional_vector)
+
+
+    def to_sensor_msgs(self, keypoints_3d):
+        points_3d = keypoints_3d[:, 3:]
+        # Add intensity = 1 to the 4th column
+        points_3d = np.hstack((points_3d,np.ones([points_3d.shape[0],1], points_3d.dtype)))
+        # print(points_3d)
+        header = Header()
+        header.frame_id = "zed_left_camera_optical_frame"
+        header.stamp = rospy.Time.now()
+
+        points_3d = points_3d
+        # print(points_3d)
+
+        pc2 = point_cloud2.create_cloud(header, self.fields, points_3d)
+        return pc2
 
     def get_o3d_pcl(self, cv_depth_image, fx, fy, cx, cy):
         pcl = o3d.geometry.PointCloud()
@@ -89,7 +134,7 @@ class PoseEstimator:
         o3d.visualization.draw_geometries([pcl])
 
 
-    def cvt_kpts_2d_to_3d(self, keypoints_2d, ratio, cv_depth_image, fx, fy, cx, cy):
+    def cvt_kpts_2d_to_3d(self, keypoints_2d, ratio, cv_depth_image, fx, fy, cx, cy, view = True):
         steps = 3
         data = []
         im = cv_depth_image.copy()
@@ -109,17 +154,22 @@ class PoseEstimator:
                             # print("COordinates ", x_coord, " Y ", y_coord)
                             # print("Original COordinates ", x_coord_original, " Y ", y_coord_original)
                             z = cv_depth_image[int(y_coord_original), int(x_coord_original)]
+
+                            # Check if depth is inconsistent
+                            if(not np.isfinite(z)):
+                                continue
                             x = (x_coord_original - cx)*z/fx
                             y = (y_coord_original - cy)*z/fy
                             data_point = [idx, i, conf, x, y, z]
                             data.append(data_point)
 
-                            cv2.circle(im, (int(x_coord_original), int(y_coord_original)), 5, (int(255), int(0), int(0)), -1)
+                            if(view):
+                                cv2.circle(im, (int(x_coord_original), int(y_coord_original)), 5, (int(255), int(255), int(255)), -1)
                             # print("ID ", i, "3D point is ", "x: ", x, " y: ", y, " z: ", z)
 
-
-        cv2.imshow('depth image', im)
-        cv2.waitKey(1)
+        if(view):
+            cv2.imshow('depth image', im)
+            cv2.waitKey(1)
         return data
 
     def get_right_hand_direction_vector(self, data):
@@ -136,7 +186,7 @@ class PoseEstimator:
                 wrist_coord = data_point[3:]
                 print(" Wrist Coord: ", wrist_coord)
         
-        if(not (np.isfinite(elbow_coord).all() or np.isfinite(wrist_coord).all())):
+        if(not (np.isfinite(elbow_coord).all() and np.isfinite(wrist_coord).all())):
             return None
         else:
             return self.get_vector(wrist_coord, elbow_coord)
@@ -151,11 +201,11 @@ class PoseEstimator:
     def preprocess_images(self, image, new_shape = (640, 640)):
         return cv2.resize(image, new_shape, interpolation=cv2.INTER_LINEAR)
 
-    def image_callback(self, image_msg):
+    def image_callback(self, image_msg, view = True):
         cv_image = self.cv_bridge.imgmsg_to_cv2(image_msg)
         cv_image = cv2.cvtColor(cv_image, cv2.COLOR_BGRA2RGB)
         # cv_image = self.preprocess_images(cv_image, new_shape=(640, 640))
-        keypoints, ratio = self.get_keypoints_2d(cv_image, view = True)
+        keypoints, ratio = self.get_keypoints_2d(cv_image, view = view)
         return keypoints, ratio
 
     def get_keypoints_2d(self, image, view = True):

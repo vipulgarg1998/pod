@@ -66,6 +66,8 @@ class PoseEstimator:
         self.fy = None 
         self.cx = None
         self.cy = None
+        self.width = None
+        self.height = None
 
         # PointCloud2 Fields
         self.fields = [PointField('x', 0, PointField.FLOAT32, 1),
@@ -89,6 +91,8 @@ class PoseEstimator:
         self.cx = float(K[2])
         self.fy = float(K[4])
         self.cy = float(K[5])
+        self.width = int(camera_info_msg.width)
+        self.height = int(camera_info_msg.height)
         self.caliberation_params_init = True
 
     def rgbd_callback(self, image_msg, depth_image_msg):
@@ -97,7 +101,7 @@ class PoseEstimator:
         cv_depth_image = self.cv_bridge.imgmsg_to_cv2(depth_image_msg)
 
         keypoints_2d, ratio = self.image_callback(image_msg, view = False)
-        keypoints_3d = self.cvt_kpts_2d_to_3d(keypoints_2d, ratio, cv_depth_image, self.fx, self.fy, self.cx, self.cy)
+        keypoints_3d = self.cvt_kpts_2d_to_3d(keypoints_2d, ratio, cv_depth_image, self.fx, self.fy, self.cx, self.cy, view=False)
         if(len(keypoints_3d) == 0):
             return
         directional_vector = self.get_right_hand_direction_vector(keypoints_3d)
@@ -156,7 +160,7 @@ class PoseEstimator:
                         conf = kpts[steps * i + 2]
                         if conf > 0.5:
                             x_coord_original, y_coord_original = int(x_coord/ratio[0]), int(y_coord/ratio[1])
-                            if(x_coord_original >= 1920 or y_coord_original >= 1080):
+                            if(x_coord_original >= self.width or y_coord_original >= self.height):
                                 continue
                             # print("COordinates ", x_coord, " Y ", y_coord)
                             # print("Original COordinates ", x_coord_original, " Y ", y_coord_original)

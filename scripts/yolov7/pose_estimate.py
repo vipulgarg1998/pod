@@ -2,12 +2,15 @@
 # ROS Libs
 import rospy
 from message_filters import ApproximateTimeSynchronizer, TimeSynchronizer, Subscriber
-from std_msgs.msg import Header
+from std_msgs.msg import Header, Empty
 from sensor_msgs import point_cloud2
 from sensor_msgs.msg import Image, PointCloud2, PointField, CameraInfo
 from geometry_msgs.msg import Point
 from visualization_msgs.msg import Marker
+from jsk_rviz_plugins.msg import OverlayText
 from cv_bridge import CvBridge # Package to convert between ROS and OpenCV Images
+
+from pose_mimic.srv import Objects
 
 # Python Libs
 import matplotlib.pyplot as plt
@@ -15,6 +18,7 @@ import torch
 import cv2
 import numpy as np
 import time
+import yaml
 import ctypes
  
 # Open3D
@@ -24,6 +28,10 @@ import ctypes
 # Yolo Libs
 import torch
 from torchvision import transforms, ops
+from detectron2.modeling.poolers import ROIPooler
+from detectron2.structures import Boxes
+from detectron2.utils.memory import retry_if_cuda_oom
+from detectron2.layers import paste_masks_in_image
 
 # References
 # https://github.com/WongKinYiu/yolov7/tree/pose
@@ -35,6 +43,7 @@ class PoseEstimator:
     def __init__(self, model_filename = '../../weights/yolov7-w6-pose.pt'):
         # super().__init__('minimal_publisher')
 
+        self.get_objects_srv = '/yolo/segmentation/objects'
 
         tss = ApproximateTimeSynchronizer(
             [Subscriber("zed/zed_node/rgb/image_rect_color", Image), 
@@ -43,9 +52,11 @@ class PoseEstimator:
         
         # self.image_sub = rospy.Subscriber("/zed/zed_node/rgb/image_rect_color", Image, self.image_callback)
         self.keypoint_pub = rospy.Publisher('keypoints', PointCloud2, queue_size=10)
+        self.stop_segmentation_pub = rospy.Publisher('/yolo/segmentation/stop', Empty, queue_size=10)
         self.vector_pub = rospy.Publisher("visualization_marker", Marker, queue_size=0)
+        self.pointed_obj_pub = rospy.Publisher("pointed_object", OverlayText, queue_size=0)
         self.camera_info_sub = rospy.Subscriber("/zed/zed_node/left/camera_info", CameraInfo, self.camera_info_callback)
- 
+
         # For OpenCV
         self.cv_bridge = CvBridge()
         self.cv_image = None
@@ -76,6 +87,10 @@ class PoseEstimator:
                 PointField('intensity', 12, PointField.FLOAT32, 1)]
 
         self.frame_id = "zed_left_camera_optical_frame"
+
+        # For Segmentation
+        self.objects = None
+
 
     def load_model(self):
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -111,6 +126,8 @@ class PoseEstimator:
         self.keypoint_pub.publish(sensor_msg)
         if(directional_vector != None):
             self.draw_vector(directional_vector)
+            if(self.objects != None):
+                self.highlight_object(directional_vector)
         # print("Direction Vector is ", directional_vector)
 
 
@@ -217,18 +234,63 @@ class PoseEstimator:
         cv_image = self.cv_bridge.imgmsg_to_cv2(image_msg)
         cv_image = cv2.cvtColor(cv_image, cv2.COLOR_BGRA2RGB)
         # cv_image = self.preprocess_images(cv_image, new_shape=(640, 640))
-        keypoints, ratio = self.get_keypoints_2d(cv_image, view = view)
+        tensor_image, ratio = self.convert_image(cv_image)
+        keypoints = self.get_keypoints_2d(tensor_image, view = view)
         return keypoints, ratio
 
-    def get_keypoints_2d(self, image, view = True):
+    def convert_image(self, image):
         image, ratio, _ = self.letterbox(image, stride=64, auto=False, scaleFill = True)
-        # print(image.shape, ratio, _)
         image = transforms.ToTensor()(image)
         image = torch.tensor(np.array([image.numpy()]))
         image = image.to(self.device)
         image = image.half()
-        # print(image.shape)
+        return image, ratio
 
+    def get_dist(self, vector_p1, vector_p2, point):
+        vector_p1 = np.array(vector_p1)
+        vector_p2 = np.array(vector_p2)
+        point = np.array(point)
+        return np.linalg.norm(np.cross(vector_p2-vector_p1, vector_p1-point))/np.linalg.norm(vector_p2-vector_p1)
+
+    def highlight_object(self, directional_vector):
+        min_dist = 1000
+        obj_pointed = None
+        for i, label in enumerate(self.objects.labels):
+            obj_centroid = [self.objects.x[i], self.objects.y[i], self.objects.z[i]] 
+            dist = self.get_dist(directional_vector[0], directional_vector[1], obj_centroid)
+            if(dist < min_dist):
+                min_dist = dist
+                obj_pointed = label
+
+        text = OverlayText()
+        text.text = f"Pointed Object is {obj_pointed}"
+        self.pointed_obj_pub.publish(text)
+        print(text.text)
+
+
+    def get_objects(self):
+        rospy.wait_for_service(self.get_objects_srv)
+        repeat_req = True
+        while(repeat_req):
+            try:
+                get_objects = rospy.ServiceProxy(self.get_objects_srv, Objects)
+                objects = get_objects()
+                repeat_req = len(objects.labels) == 0
+
+                if(not repeat_req):
+                    self.objects = objects
+                    print(self.objects)
+                    # self.stop_segmentation_pub.publish(Empty())
+                # print(objects.labels)
+                # print(objects.x)
+                # print(objects.y)
+                # print(objects.z)
+            except rospy.ServiceException as e:
+                print("Service call failed: %s"%e)
+
+        self.load_model()
+
+    def get_keypoints_2d(self, image, view = True):
         # Forward Pass to the model
         start_time = time.time()            # Get the start time.
         with torch.no_grad():
@@ -270,12 +332,12 @@ class PoseEstimator:
             # Press `q` to exit.
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 self.exit()
-        return output, ratio
+        return output
 
     def exit(self):
         cv2.destroyAllWindows()
 
-    def draw_vector(self, vector, scale = 10, hide = False):
+    def draw_vector(self, vector, scale = 4, hide = False):
         arrow = Marker()
         arrow.header.frame_id = self.frame_id
         arrow.header.stamp = rospy.Time.now()
@@ -534,7 +596,9 @@ def main(args=None):
     rospy.init_node('pose_estimate', anonymous=True)
 
     pose_estimator = PoseEstimator()
-    pose_estimator.load_model()
+    pose_estimator.get_objects()
+    # pose_estimator.load_model()
+    # pose_estimator.load_segmentation_model()
     
     rospy.spin()
 

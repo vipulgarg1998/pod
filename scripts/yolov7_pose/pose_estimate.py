@@ -2,15 +2,18 @@
 # ROS Libs
 import rospy
 from message_filters import ApproximateTimeSynchronizer, TimeSynchronizer, Subscriber
-from std_msgs.msg import Header, Empty
+from std_msgs.msg import Header, Empty, Float64MultiArray
 from sensor_msgs import point_cloud2
 from sensor_msgs.msg import Image, PointCloud2, PointField, CameraInfo
-from geometry_msgs.msg import Point
+from geometry_msgs.msg import Point, Pose, PoseArray
 from visualization_msgs.msg import Marker
 from jsk_rviz_plugins.msg import OverlayText
 from cv_bridge import CvBridge # Package to convert between ROS and OpenCV Images
 
 from pose_mimic.srv import Objects
+
+# Random Library 
+from robot_helpers.transform_services import TransformServices
 
 # Python Libs
 import matplotlib.pyplot as plt
@@ -55,6 +58,7 @@ class PoseEstimator:
         self.stop_segmentation_pub = rospy.Publisher('/yolo/segmentation/stop', Empty, queue_size=10)
         self.vector_pub = rospy.Publisher("visualization_marker", Marker, queue_size=0)
         self.pointed_obj_pub = rospy.Publisher("pointed_object", OverlayText, queue_size=0)
+        self.pointed_obj_centroid_pub = rospy.Publisher("pointed_object/centroid", PoseArray, queue_size=10)
         self.camera_info_sub = rospy.Subscriber("/zed/zed_node/left/camera_info", CameraInfo, self.camera_info_callback)
 
         # For OpenCV
@@ -68,10 +72,6 @@ class PoseEstimator:
         self.model = None
 
         # For Camera 
-        # self.fx = 1404.6019287109375
-        # self.fy = 1404.6019287109375 
-        # self.cx = 948.8173217773438
-        # self.cy = 557.4688110351562
         self.caliberation_params_init = False
         self.fx = None
         self.fy = None 
@@ -91,6 +91,8 @@ class PoseEstimator:
         # For Segmentation
         self.objects = None
 
+        # For transforming the frame of centroids
+        self.ts = TransformServices()
 
     def load_model(self):
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -254,6 +256,7 @@ class PoseEstimator:
 
     def highlight_object(self, directional_vector):
         min_dist = 1000
+        pointed_obj_centroid = None
         obj_pointed = None
         for i, label in enumerate(self.objects.labels):
             obj_centroid = [self.objects.x[i], self.objects.y[i], self.objects.z[i]] 
@@ -261,11 +264,31 @@ class PoseEstimator:
             if(dist < min_dist):
                 min_dist = dist
                 obj_pointed = label
+                pointed_obj_centroid = obj_centroid
 
         text = OverlayText()
-        text.text = f"Pointed Object is {obj_pointed}"
+        text.text = f"Pointed Object is {obj_pointed} with centroid {pointed_obj_centroid}"
         self.pointed_obj_pub.publish(text)
         print(text.text)
+        
+
+        centroid_msg_array = PoseArray()
+        centroid_msg = Pose()
+        centroid_msg.position.x = pointed_obj_centroid[0]
+        centroid_msg.position.y = pointed_obj_centroid[1]
+        centroid_msg.position.z = pointed_obj_centroid[2]
+
+        centroid_msg.orientation.x = 0
+        centroid_msg.orientation.y = 0
+        centroid_msg.orientation.z = 0
+        centroid_msg.orientation.w = 1
+        
+        centroid_msg_array.poses.append(centroid_msg)
+
+        centroid_msg_array = self.ts.transform_poses("aruco_base", "zed_color_optical_frame", centroid_msg_array)
+        self.ts.create_frame_at_pose(centroid_msg_array.poses[0], "aruco_base", f"{obj_pointed}_frame")
+
+        self.pointed_obj_centroid_pub.publish(centroid_msg_array)
 
 
     def get_objects(self):

@@ -42,7 +42,7 @@ from detectron2.layers import paste_masks_in_image
 # https://learnopencv.com/yolov7-object-detection-paper-explanation-and-inference/
  
 class PoseEstimator:
-    def __init__(self, model_filename = '../../weights/yolov7-mask.pt', server_deactivated = False):
+    def __init__(self, model_filename = '../../weights/yolov7-mask.pt', server_deactivated = False, view = False):
         # super().__init__('minimal_publisher')
 
 
@@ -82,6 +82,7 @@ class PoseEstimator:
         self.model_loaded = False
         self.stop_segmentation = False
         self.seg_in_prog = False
+        self.view = view
         self.server_deactivated = server_deactivated
         # Service for pose_mimic
         if(not server_deactivated):
@@ -198,7 +199,7 @@ class PoseEstimator:
             self.keypoint_pub.publish(sensor_msg)
         else:
             cv_depth_image = self.cv_bridge.imgmsg_to_cv2(depth_image_msg)
-            segments, ratio = self.image_callback(image_msg, view = False)
+            segments, ratio = self.image_callback(image_msg, view = self.view)
             segments_3d = self.cvrt_2d_to_3d(segments, ratio, cv_depth_image, self.fx, self.fy, self.cx, self.cy, view=False)
             self.segments_3d.append(segments_3d)
             self.centroids.append(self.get_centroids(segments_3d))
@@ -290,7 +291,7 @@ class PoseEstimator:
 
     def apply_segmentation(self, image, view = False):
         segments = {}
-
+        idx = 0 # keeps the track of the label
         output = self.seg_model(image)
         inf_out, train_out, attn, mask_iou, bases, sem_output = output['test'], output['bbox_and_cls'], output['attn'], output['mask_iou'], output['bases'], output['sem']
         bases = torch.cat([bases, sem_output], dim=1)
@@ -313,16 +314,18 @@ class PoseEstimator:
         nbboxes = bboxes.tensor.detach().cpu().numpy().astype(np.int)
         pnimg = nimg.copy()
         for one_mask, bbox, cls, conf in zip(pred_masks_np, nbboxes, pred_cls, pred_conf):
-            label = names[int(cls)]
-            if conf < 0.25 or label == 'person' or label == "bed":
+            label = f"{names[int(cls)]}"
+            if conf < 0.25 or label == 'person' or label == "bed" or label == "laptop" or label == "chair":
                 continue
-
+            label = f"{label}_{idx}"
+            idx = idx + 1
             segments[label] = one_mask
             if view:            
                 color = [np.random.randint(255), np.random.randint(255), np.random.randint(255)]
                                     
                 pnimg[one_mask] = pnimg[one_mask] * 0.5 + np.array(color, dtype=np.uint8) * 0.5
                 pnimg = cv2.rectangle(pnimg, (bbox[0], bbox[1]), (bbox[2], bbox[3]), color, 2)
+                pnimg = cv2.putText(pnimg, label, (bbox[0], bbox[1] - 2), 0, 0.5, [255, 255, 255], thickness=1, lineType=cv2.LINE_AA)
         
         if view:
             cv2.imshow('image', pnimg)
@@ -376,6 +379,8 @@ class PoseEstimator:
             # print(centroid.shape)
             # if(centroid.shape[0] != 3):
             #     continue
+            if(centroid[2] > 3): # Ignore all the objects that are far
+                continue
             centroids[i] = centroid
             print(i, centroids[i])
             # if(len(segments_3d[i]) > 0):
@@ -394,7 +399,7 @@ def main(args=None):
     # initializing the subscriber node
     rospy.init_node('pose_estimate', anonymous=True)
 
-    pose_estimator = PoseEstimator(server_deactivated = False)
+    pose_estimator = PoseEstimator(server_deactivated = False, view = False)
     pose_estimator.load_segmentation_model()
     
     rospy.spin()

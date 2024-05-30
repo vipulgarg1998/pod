@@ -1,5 +1,5 @@
-# pose_mimic
-This project is build as a ROS package and uses YOLO-v7 models for human pose detection and instance segmentation. The algorithm is based on this [paper](https://drive.google.com/file/d/1Jyk4RMjvvgMNGzvr7nbpZMZ5aRgOA6Ac/view?usp=share_link)
+# POL: Pointed Object Localization
+POL is used to determine the pose of the object that is being pointed by the human. This project is build as a ROS package and uses YOLO-v7 models for human pose detection and instance segmentation. The algorithm is based on this [paper](https://drive.google.com/file/d/1Jyk4RMjvvgMNGzvr7nbpZMZ5aRgOA6Ac/view?usp=share_link)
 
 ## Requirements 
 - ZED camera is connected
